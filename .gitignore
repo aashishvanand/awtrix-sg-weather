@@ -1,14 +1,14 @@
 # secrets
 .env
 
+# Personal n8n workflow configs (contain home coordinates / clock IP)
+*_workflow.local.json
+
 # macOS
 .DS_Store
 
 # scratch
 *.log
-
-# local upload state (tracks what's already on the clock)
-.upload_state.json
 
 # IDE settings
 .claude/
