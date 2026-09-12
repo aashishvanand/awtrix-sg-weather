@@ -184,8 +184,9 @@ Import through n8n's **Import from File**, then fill in the **Config** node:
 | Field | Description |
 |---|---|
 | `HOME_LAT` / `HOME_LON` | Coordinates used for the nearest station / area / region match |
-| `CLOCK_IP` | The clock's static IP |
+| `CLOCK_IP` | The AWTRIX NG clock's static IP |
 | `DATA_GOV_SG_API_KEY` | From [data.gov.sg](https://guide.data.gov.sg/developer-guide/api-keys). The endpoints work without a key, but one raises the rate limit and is more reliable |
+| `CLOCK2_IP` | Optional. Static IP of a second, TC002-firmware clock — see [Second clock (TC002)](#second-clock-tc002) below |
 
 ### Execution flow
 
@@ -212,9 +213,9 @@ roughly 6×.
 | App | When | Content |
 |---|---|---|
 | `current_weather` | every run | Temperature and humidity; icon from the current 2-hour forecast condition |
-| `weather_forecast` | every run | The forecast's valid window (e.g. `NEXT 5-7PM`), same icon. data.gov.sg's 2-hour forecast is effectively "conditions for the next ~2 hours" — there is no finer-grained data |
+| `weather_forecast` | every run | The forecast's valid window (e.g. `FORECAST 5-7PM`), same icon. data.gov.sg's 2-hour forecast is effectively "conditions for the next ~2 hours" — there is no finer-grained data |
 | `aqi` | every run | Nearest-region PM2.5 with a severity-band icon. UV was dropped because data.gov.sg's UV index reads `0` outside daylight hours |
-| `sunrise_sunset` | within ±2 h of sunrise or sunset | `RISE 6-8AM` around sunrise, `SET 6-8PM` around sunset |
+| `sunrise_sunset` | within ±2 h of sunrise or sunset | The exact USNO event time, e.g. `RISE 7:01AM` / `SET 7:10PM` |
 | `moon_phase` | between sunset and the next sunrise | Phase icon and illuminated fraction (e.g. `WANING GIBBOUS 99%`) |
 
 The native **clock** (`Time`) app and the **airline** app (from the separate
@@ -224,16 +225,14 @@ The native **clock** (`Time`) app and the **airline** app (from the separate
 meaningful after dark, and a sunrise or sunset window is only interesting near
 the event; pushing them all day would crowd the rotation. `sunrise_sunset`
 therefore appears only in a 4-hour band centred on each event, and `moon_phase`
-only at night. `sunrise_sunset` shows an approximate ±1-hour window
-(`RISE 6-8AM`) rather than a to-the-minute time, matching the
-`weather_forecast` app's `NEXT 5-7PM` style.
+only at night.
 
 **How the time-gated apps are removed.** A pushed app stays on the clock until
 it is re-pushed or expires. `sunrise_sunset` and `moon_phase` are sent with
-`lifetime: 360` and `lifetimeMode: 0`, so once the workflow stops pushing them
-the clock removes them within about six minutes — just over one 5-minute cycle,
-which absorbs a single missed run without the app flickering in and out. The
-always-on apps carry no `lifetime` and are simply re-pushed every run.
+`lifetimeMs: 360000`, so once the workflow stops pushing them the clock removes
+them within about six minutes — just over one 5-minute cycle, which absorbs a
+single missed run without the app flickering in and out. The always-on apps
+carry no `lifetimeMs` and are simply re-pushed every run.
 
 **App names.** A name is the final path segment of
 `PUT /api/v1/apps/pushed/<name>`, so names use underscores, not spaces. The apps
@@ -263,8 +262,38 @@ The pushed-app API rejects unknown keys and validates enums strictly:
 - The push endpoint is `PUT /api/v1/apps/pushed/<name>`, not the older
   `POST /api/custom?name=<name>`. To remove an app, use
   `DELETE /api/v1/apps/<name>` — a `PUT` with an empty body is rejected.
-- `lifetime` (seconds; `0` = never) and `lifetimeMode` (`0` = delete, `1` =
-  mark stale) are accepted, and are used by the time-gated apps.
+- `lifetimeMs` (milliseconds; omitted = never expires) is accepted, and is used
+  by the time-gated apps.
+
+### Second clock (TC002)
+
+Setting `CLOCK2_IP` (leave blank to skip) also pushes every app to a second,
+TC002-firmware clock, in parallel with the AWTRIX NG one:
+
+```
+Build Payloads → Build Payload TC002 → Push to Clock 2 (TC002): POST /api/custom?name=<app>
+```
+
+TC002 differs enough from AWTRIX NG that it needs its own payload builder and
+its own push node, not just a second URL:
+
+- **Endpoint.** TC002 has no `PUT /api/v1/apps/pushed/<name>` equivalent — it
+  only exposes `POST /api/custom?name=<app>`, so `Push to Clock 2` uses that
+  older-style call intentionally (it is not a leftover from before AWTRIX NG's
+  endpoint was fixed above).
+- **Text.** TC002 doesn't strip non-ASCII or uppercase automatically the way
+  AWTRIX NG's `textCase: 'upper'` does, so `Build Payload TC002` does both
+  itself (e.g. the `°` in temperature becomes a small drawn ring instead).
+- **Icons.** TC002 has no icon-by-ID gallery. Each AWTRIX icon ID used above is
+  fetched once from the LaMetric gallery as an 8×8 GIF, 2× upscaled to 16×16,
+  and embedded in `Build Payload TC002` as a base64 lookup so every push can
+  inline the matching icon directly in the payload.
+- **Expiry.** TC002 has no `lifetimeMs` mechanism — a pushed app stays until
+  explicitly cleared. So for `sunrise_sunset` / `moon_phase`, when they fall
+  outside their AWTRIX NG time window, `Build Payload TC002` still emits an
+  empty `{}` payload for that app, and `Push to Clock 2` POSTs it to clear the
+  slot; otherwise a stale sunrise or moon card would linger on the clock all
+  day.
 
 ### Deploying and updating
 
