@@ -1,0 +1,278 @@
+{
+  "name": "AWTRIX - Live Weather (TC002 on Ulanzi firmware)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "name": "Every 5min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "name": "HOME_LAT",
+              "type": "string",
+              "value": "YOUR_HOME_LAT"
+            },
+            {
+              "name": "HOME_LON",
+              "type": "string",
+              "value": "YOUR_HOME_LON"
+            },
+            {
+              "name": "CLOCK_IP",
+              "type": "string",
+              "value": "YOUR_CLOCK_IP"
+            },
+            {
+              "name": "DATA_GOV_SG_API_KEY",
+              "type": "string",
+              "value": "YOUR_DATA_GOV_SG_API_KEY"
+            },
+            {
+              "name": "CLOCK2_IP",
+              "type": "string",
+              "value": "YOUR_CLOCK2_IP"
+            }
+          ]
+        }
+      },
+      "name": "Config (edit per location)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1000,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api-open.data.gov.sg/v2/real-time/api/air-temperature",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $json.DATA_GOV_SG_API_KEY }}"
+            }
+          ]
+        }
+      },
+      "name": "Fetch Air Temperature (data.gov.sg)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -800,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api-open.data.gov.sg/v2/real-time/api/relative-humidity",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $('Config (edit per location)').item.json.DATA_GOV_SG_API_KEY }}"
+            }
+          ]
+        }
+      },
+      "name": "Fetch Relative Humidity (data.gov.sg)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -600,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Forecast/PM2.5/UV all update far less often (~every 30min-1hr) than the\n// live temp/humidity readings above, so cache them in workflow static data\n// and only re-fetch once the cache is stale. This cuts data.gov.sg API\n// calls roughly 6x since this workflow still runs every 5 minutes.\nconst cfg = $('Config (edit per location)').item.json;\nconst staticData = $getWorkflowStaticData('global');\nconst now = Date.now();\nconst CACHE_MS = 30 * 60 * 1000;\n\nif (staticData.slowWeather && (now - staticData.slowWeather.cachedAt) < CACHE_MS) {\n  return [{ json: staticData.slowWeather.data }];\n}\n\nconst headers = { 'x-api-key': cfg.DATA_GOV_SG_API_KEY };\n\nconst sgDate = new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);\n\nconst [forecastResp, pm25Resp, moonResp] = await Promise.all([\n  this.helpers.httpRequest({ method: 'GET', url: 'https://api-open.data.gov.sg/v2/real-time/api/two-hr-forecast', headers, json: true }),\n  this.helpers.httpRequest({ method: 'GET', url: 'https://api-open.data.gov.sg/v2/real-time/api/pm25', headers, json: true }),\n  // USNO (US Naval Observatory) - authoritative, free, no API key - gives\n  // the current named moon phase (curphase) plus today's sun rise/set\n  // times (sundata, SG local time), so no local astronomical calc is needed.\n  this.helpers.httpRequest({ method: 'GET', url: `https://aa.usno.navy.mil/api/rstt/oneday?date=${sgDate}&coords=${cfg.HOME_LAT},${cfg.HOME_LON}&tz=8`, json: true }),\n]);\n\nconst data = { forecast: forecastResp.data, pm25: pm25Resp.data, astro: moonResp.properties && moonResp.properties.data };\nstaticData.slowWeather = { cachedAt: now, data };\n\nreturn [{ json: data }];"
+      },
+      "name": "Fetch Forecast/PM2.5 (cached 30min)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -400,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Both the sensor readings and the forecast/PM2.5 come from a network of\n// stations/areas/regions, not a single point - pick whichever is\n// physically closest to home for each.\nconst cfg = $('Config (edit per location)').item.json;\nconst tempResp = $('Fetch Air Temperature (data.gov.sg)').item.json.data;\nconst humResp = $('Fetch Relative Humidity (data.gov.sg)').item.json.data;\nconst slow = $input.first().json;\nconst forecastResp = slow.forecast;\nconst pm25Resp = slow.pm25;\n\nfunction haversineKm(lat1, lon1, lat2, lon2) {\n  const R = 6371;\n  const dLat = (lat2 - lat1) * Math.PI / 180;\n  const dLon = (lon2 - lon1) * Math.PI / 180;\n  const a = Math.sin(dLat / 2) ** 2 +\n    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *\n    Math.sin(dLon / 2) ** 2;\n  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));\n}\n\nfunction nearestReading(resp) {\n  const stationsById = Object.fromEntries(resp.stations.map(s => [s.id, s.location]));\n  const readings = resp.readings[0].data;\n  const withDist = readings\n    .filter(r => stationsById[r.stationId])\n    .map(r => ({\n      value: r.value,\n      distanceKm: haversineKm(cfg.HOME_LAT, cfg.HOME_LON, stationsById[r.stationId].latitude, stationsById[r.stationId].longitude)\n    }))\n    .sort((a, b) => a.distanceKm - b.distanceKm);\n  return withDist[0].value;\n}\n\nfunction nearestForecast(resp) {\n  const areasByName = Object.fromEntries(resp.area_metadata.map(a => [a.name, a.label_location]));\n  const forecasts = resp.items[0].forecasts;\n  const withDist = forecasts\n    .filter(f => areasByName[f.area])\n    .map(f => ({\n      forecast: f.forecast,\n      distanceKm: haversineKm(cfg.HOME_LAT, cfg.HOME_LON, areasByName[f.area].latitude, areasByName[f.area].longitude)\n    }))\n    .sort((a, b) => a.distanceKm - b.distanceKm);\n  return { forecast: withDist[0].forecast, validPeriodText: resp.items[0].valid_period.text };\n}\n\nfunction nearestPM25(resp) {\n  const regionsByName = Object.fromEntries(resp.regionMetadata.map(r => [r.name, r.labelLocation]));\n  const readings = resp.items[0].readings.pm25_one_hourly;\n  const withDist = Object.entries(readings)\n    .filter(([name]) => regionsByName[name])\n    .map(([name, value]) => ({\n      value,\n      distanceKm: haversineKm(cfg.HOME_LAT, cfg.HOME_LON, regionsByName[name].latitude, regionsByName[name].longitude)\n    }))\n    .sort((a, b) => a.distanceKm - b.distanceKm);\n  return withDist[0].value;\n}\n\n// Compacts a data.gov.sg valid_period string like\n// \"5.00 pm to 7.00 pm\" into \"5-7PM\" for the small clock display.\nfunction compactPeriod(text) {\n  const m = text.match(/(\\d{1,2})[.:]\\d{2}\\s*(am|pm)\\s*to\\s*(\\d{1,2})[.:]\\d{2}\\s*(am|pm)/i);\n  if (!m) return text.toUpperCase();\n  const [, h1, ap1, h2, ap2] = m;\n  return ap1.toLowerCase() === ap2.toLowerCase()\n    ? `${h1}-${h2}${ap2.toUpperCase()}`\n    : `${h1}${ap1.toUpperCase()}-${h2}${ap2.toUpperCase()}`;\n}\n\n// Maps data.gov.sg 2-hour forecast strings to AWTRIX icon IDs - added to\n// the clock manually via its web UI (Icons -> Fetch from LaMetric gallery\n// by ID -> Save to AWTRIX), not uploaded by this workflow or any script.\n// See README for the full list of IDs this workflow needs. Picked to match\n// https://flows.blueforcer.de/flow/QZ0sO0JQb7ut, extended to cover the\n// extra conditions data.gov.sg reports that open-meteo doesn't. Singapore\n// never reports snow, so unlike that flow's source there's no snow icon.\nconst FORECAST_ICON = {\n  'Fair': '53386',\n  'Fair (Day)': '53386',\n  'Fair (Night)': '53386',\n  'Fair and Warm': '53386',\n  'Partly Cloudy': '2286',\n  'Partly Cloudy (Day)': '2286',\n  'Partly Cloudy (Night)': '2286',\n  'Cloudy': '53384',\n  'Hazy': '17055',\n  'Slightly Hazy': '17055',\n  'Windy': '2286',\n  'Mist': '17055',\n  'Fog': '17055',\n  'Light Rain': '2720',\n  'Moderate Rain': '2720',\n  'Heavy Rain': '49300',\n  'Passing Showers': '2720',\n  'Light Showers': '2720',\n  'Showers': '49300',\n  'Heavy Showers': '49300',\n  'Thundery Showers': '29839',\n  'Heavy Thundery Showers': '29839',\n  'Heavy Thundery Showers with Gusty Winds': '29839'\n};\nconst DEFAULT_ICON = '36637';\n\n// Clear sky at night shows the current moon phase instead of the sun icon\n// used for daytime 'Fair'. Named phase comes from USNO (see fetch node);\n// this map covers the 8 primary/intermediate phases USNO's curphase\n// returns, icon IDs from the LaMetric gallery (added to the clock\n// manually, see README).\nconst MOON_PHASE_ICON = {\n  'New Moon': '2318',\n  'Waxing Crescent': '2317',\n  'First Quarter': '2316',\n  'Waxing Gibbous': '2315',\n  'Full Moon': '2314',\n  'Waning Gibbous': '2319',\n  'Last Quarter': '2320',\n  'Waning Crescent': '2321',\n};\n\n// Local synodic-month fallback, used only if USNO is unreachable or\n// returns a phase name outside the map above.\nfunction moonPhaseIconFallback(date) {\n  const synodicMonthDays = 29.53058867;\n  const knownNewMoonUtc = Date.UTC(2000, 0, 6, 18, 14, 0);\n  const daysSince = (date.getTime() - knownNewMoonUtc) / 86400000;\n  let phase = (daysSince % synodicMonthDays) / synodicMonthDays;\n  if (phase < 0) phase += 1;\n  const icons = ['2318', '2317', '2316', '2315', '2314', '2319', '2320', '2321'];\n  const bucket = Math.floor(((phase + 1 / 16) % 1) * 8);\n  return icons[bucket];\n}\n\nfunction moonPhaseIcon(astroData, date) {\n  const name = astroData && astroData.curphase;\n  if (name && MOON_PHASE_ICON[name]) return MOON_PHASE_ICON[name];\n  return moonPhaseIconFallback(date);\n}\n\n// Night variants of the cloud conditions. data.gov.sg tags dark-hours\n// forecasts with a '(Night)' suffix ('Partly Cloudy (Night)' etc.);\n// keyed here on the base condition with that suffix stripped. Icon IDs\n// from the LaMetric gallery, added to the clock manually (see README).\n// The clock's icon partition is often full, so any value left '' just\n// keeps the daytime icon rather than rendering a blank slot.\nconst NIGHT_ICON = {\n  'Partly Cloudy': '43737', // moon + cloud; '' -> falls back to day '2286'\n};\n// Other night icons picked but unused: data.gov.sg only ever suffixes\n// 'Fair' and 'Partly Cloudy' with '(Day)'/'(Night)', so rain / thundery\n// conditions never arrive tagged as night. Add a key above (and the icon\n// to the clock) only if that changes: moon + rain 43738, heavier rain\n// 43739, drizzle 43747, thunderstorm 43748.\n\n// Clear sky at night shows the actual moon phase; other '(Night)'\n// conditions use NIGHT_ICON if a night icon has been added, else the\n// normal (daytime) FORECAST_ICON entry.\nfunction pickIcon(text) {\n  if (/\\(Night\\)\\s*$/i.test(text)) {\n    const base = text.replace(/\\s*\\(Night\\)\\s*$/i, '').trim();\n    if (base === 'Fair' || base === 'Fair and Warm') return moonPhaseIcon(slow.astro, new Date());\n    if (NIGHT_ICON[base]) return NIGHT_ICON[base];\n  }\n  return FORECAST_ICON[text] || DEFAULT_ICON;\n}\n\n// data.gov.sg's 2hr-forecast is really \"the forecast for the upcoming ~2hr\n// window\", so it doubles as both \"current conditions\" and \"next\" - there's\n// no finer-grained hourly forecast available from the API.\nconst { forecast: forecastText, validPeriodText } = nearestForecast(forecastResp);\nconst forecastIcon = pickIcon(forecastText);\n\nconst temp = Math.round(nearestReading(tempResp));\nconst hum = Math.round(nearestReading(humResp));\nconst weatherPayload = { text: `${temp}\u00b0C ${hum}%`, icon: forecastIcon, durationMs: 8000, textCase: 'upper' };\n\nconst forecastPayload = { text: `FORECAST ${compactPeriod(validPeriodText)}`, icon: forecastIcon, durationMs: 8000, textCase: 'upper' };\n\n// AWTRIX's \"AQI\" icon set - 12 severity tiers, also added manually via the\n// clock's web UI (see README). Bands the raw PM2.5 reading (ug/m3) against\n// each tier's icon.\nconst AQI_ICON_BANDS = [\n  { max: 25, icon: '39706' },\n  { max: 40, icon: '39709' },\n  { max: 60, icon: '39710' },\n  { max: 90, icon: '39711' },\n  { max: 110, icon: '39712' },\n  { max: 140, icon: '39713' },\n  { max: 160, icon: '39714' },\n  { max: 190, icon: '39715' },\n  { max: 210, icon: '39716' },\n  { max: 290, icon: '39717' },\n  { max: 310, icon: '39718' },\n];\nconst AQI_ICON_OVER_MAX = '39719';\n\nfunction aqiIconFor(pm25) {\n  const band = AQI_ICON_BANDS.find(b => pm25 <= b.max);\n  return band ? band.icon : AQI_ICON_OVER_MAX;\n}\n\nconst pm25 = Math.round(nearestPM25(pm25Resp));\nconst aqIcon = aqiIconFor(pm25);\nconst aqiPayload = { text: `PM2.5 ${pm25}`, icon: aqIcon, durationMs: 8000, textCase: 'upper' };\n\n// Sunrise / sunset - times come from the same USNO response as the moon\n// phase (sundata, \"HH:MM\" in SG time), with fixed SG fallbacks if USNO is\n// unreachable (Singapore's rise/set barely move across the year). The\n// `sun` app is only pushed within +/-2h of the next event; its text\n// shows the exact event time from USNO, e.g. \"RISE 7:01AM\" / \"SET\n// 7:10PM\". The `moon` app is only pushed at night (after sunset /\n// before sunrise). Both carry a short `lifetimeMs` so the clock removes\n// them a few minutes after their window closes and we stop re-pushing -\n// the always-on apps (weather / weather_forecast / aqi) have no lifetimeMs\n// and just get re-pushed every run.\nfunction sunEventMinutes(astro, phen) {\n  const hit = ((astro && astro.sundata) || []).find(p => p.phen === phen);\n  if (!hit) return null;\n  const [h, m] = hit.time.split(':').map(Number);\n  return h * 60 + m;\n}\n\n// Formats an SG minutes-past-midnight value as an exact 12-hour clock\n// time like \"7:01AM\" / \"7:10PM\" for the small clock display.\nfunction sunTime(mins) {\n  const t = ((mins % 1440) + 1440) % 1440;\n  const h24 = Math.floor(t / 60);\n  const mm = t % 60;\n  const ap = h24 < 12 ? 'AM' : 'PM';\n  const h12 = h24 % 12 || 12;\n  return `${h12}:${String(mm).padStart(2, '0')}${ap}`;\n}\n\nconst sgNow = new Date(Date.now() + 8 * 60 * 60 * 1000);\nconst sgNowMin = sgNow.getUTCHours() * 60 + sgNow.getUTCMinutes();\nconst sunriseMin = sunEventMinutes(slow.astro, 'Rise') ?? 421;  // 07:01 SG fallback\nconst sunsetMin = sunEventMinutes(slow.astro, 'Set') ?? 1150;   // 19:10 SG fallback\n\n// SG for/sunset sit far from midnight, so a plain +/-2h check needs\n// no day-wrap handling. lifetimeMs 360000 (360s) > the 300s push interval, so one\n// missed run won't flap the app, but it clears ~6min after its window.\nconst SUN_GATE_MIN = 120;\n\nlet sunPayload = null;\nif (Math.abs(sgNowMin - sunriseMin) <= SUN_GATE_MIN) {\n  sunPayload = { text: `RISE ${sunTime(sunriseMin)}`, icon: '22588', durationMs: 8000, textCase: 'upper', lifetimeMs: 360000 };\n} else if (Math.abs(sgNowMin - sunsetMin) <= SUN_GATE_MIN) {\n  sunPayload = { text: `SET ${sunTime(sunsetMin)}`, icon: '12061', durationMs: 8000, textCase: 'upper', lifetimeMs: 360000 };\n}\n\n// Moon phase app - night only (after sunset / before sunrise). Icon is the\n// current phase; text is the phase name + illuminated fraction, e.g.\n// \"WANING GIBBOUS 99%\". (The same icon is still used as the weather icon\n// on a clear night, driven by the forecast string, independently of this.)\nlet moonPayload = null;\nif (sgNowMin >= sunsetMin || sgNowMin < sunriseMin) {\n  const moonPhaseName = (slow.astro && (slow.astro.curphase || (slow.astro.closestphase && slow.astro.closestphase.phase))) || '';\n  const moonIllum = (slow.astro && slow.astro.fracillum) || '';\n  moonPayload = {\n    text: `${moonPhaseName} ${moonIllum}`.trim() || 'MOON',\n    icon: moonPhaseIcon(slow.astro, new Date()),\n    durationMs: 8000,\n    textCase: 'upper',\n    lifetimeMs: 360000,\n  };\n}\n\nconst items = [\n  { json: { app: 'current_weather', payload: weatherPayload } },\n  { json: { app: 'weather_forecast', payload: forecastPayload } },\n  { json: { app: 'aqi', payload: aqiPayload } },\n];\nif (sunPayload) items.push({ json: { app: 'sunrise_sunset', payload: sunPayload } });\nif (moonPayload) items.push({ json: { app: 'moon_phase', payload: moonPayload } });\nreturn items;"
+      },
+      "name": "Build Payloads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=http://{{ $('Config (edit per location)').item.json.CLOCK_IP }}/api/v1/apps/pushed/{{ $json.app }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}"
+      },
+      "name": "Push to Clock",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// TC002: ASCII only (no degree sign etc.), no automatic uppercasing like\n// AWTRIX NG's textCase:'upper' - strip non-ASCII and uppercase ourselves.\n// Icons: TC002 has no icon-by-ID system (see TC002-PUSH-NOTES.md in the\n// Awtrix Feeder repo), so the same LaMetric icon IDs used by the AWTRIX NG\n// payloads above are downloaded once from the LaMetric gallery and embedded\n// here as a base64 lookup map so every push can inline the matching icon.\n// Source is each icon's native 8x8 GIF\n// (developer.lametric.com/content/apps/icon_thumbs/<id>.gif); every frame\n// is 2x nearest-neighbor upscaled to 16x16 (no higher-res source exists -\n// these are natively 8x8 pixel art) and flattened onto black, with the\n// per-frame delays kept. Flattening onto black (rather than keeping the\n// GIF's transparency) just matches how the clock's existing static icons\n// look - the firmware animates transparent GIFs fine either way. IDs\n// whose LaMetric icon has no animation (53386 Fair, the 39706-39719 AQI\n// ramp, the 2314-2321 moon phases) stay single-frame.\nconst ICON16_B64 = {\"12061\": \"R0lGODlhEAAQAIEAAPz+HAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQECgAAACwAAAAAEAAQAAAIMQADCAwAoKDBggMTEjxoUOFChgwTQoQocKLFixgzatzIsaPHjRUzShSp0KLDkBQHBgQAIfkEBAoAAAAsAAAAABAAEACB/P4cAAAAAAAAAAAACC8AAwgcSLCgwYMIAShcqDAhw4UGH0oEQHDiQ4EWM2rcyLGjx48gQ0IMwLHiRoEBAQAh+QQECgAAACwAAAIAEAAOAIH8/hwAAAAAAAAAAAAIKQADCBxIsKDBgwgBKFyoMCHDhQYfSgRAcOJDgRYzatzIsaPHjyBDLgwIACH5BAQKAAAALAAABAAQAAYAgfz+HAAAAAAAAAAAAAgdAAMIHEiwoMGDCAEoXKgwIcOFBh9KBEBw4kOBAQEAIfkEBAoAAAAsAAAGABAABgCB/P4cAAAAAAAAAAAACB0AAwgcSLCgwYMIAShcqDAhw4UGH0oEQHDiQ4EBAQAh+QQECgAAACwAAAgAEAAGAIH8/hwAAAAAAAAAAAAIHQADCBxIsKDBgwgBKFyoMCHDhQYfSgRAcOJDgQEBACH5BAQKAAAALAAACgAQAAYAgfz+HAAAAAAAAAAAAAgdAAMIHEiwoMGDCAEoXKgwIcOFBh9KBEBw4kOBAQEAIfkEBAoAAAAsAgAMAAwABACB/P4cAAAAAAAAAAAACBQAAwgcSLCgwYIAEipMSHDhQoEBAQAh+QQEMgAAACwEAA4ACAACAIEAAAAAAAAAAAAAAAAICQABCBxIsCCAgAA7\", \"17055\": \"R0lGODlhEAAQAIEAAKymnAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQEMgAAACwAAAAAEAAQAAAILwADCBxIsKDBgwgBKFzI0CDDhwAQSpx4EKJAiBgjBshIsSPFjAodgvRIsqTJiQEBACH5BAQyAAAALAIAAgAMAAoAgaymnAAAAAAAAAAAAAgjAAEIHEgwQACCCAEYXMiwoUOHCQ0mLHhw4MOLGCVOFKhxY0AAOw==\", \"22588\": \"R0lGODlhEAAQAIEAAAAAAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQEHgAAACwAAAAAEAAQAAAIHQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFgQEBACH5BAQeAAAALAAAAAAQABAAgTw2LAAAAAAAAAAAAAgdAAEIHEiwoMGDCBMqXMiwocOHECNKnEixosWBAQEAIfkEBB4AAAAsAAAAABAAEACBfF48AAAAAAAAAAAACB0AAQgcSLCgwYMIEypcyLChw4cQI0qcSLGixYEBAQAh+QQEHgAAACwAAAAAEAAQAIH8/hzEhkQAAAAAAAAIIgADCBxIsKDBgwgTKlzIsKHDhxAjSpxIkSKAiwAYYsxYMCAAIfkEBDwAAAAsAAAAABAAEACB/P4c5KJkAAAAAAAACCgAAwgcSLCgwYMIEypcyLChw4cQI0qciBCARQAML2JMqFFjxY4WCQYEACH5BAQeAAAALAAAAAAQABAAgfz+HPS+jAAAAAAAAAgsAAMIHEiwoMGDCBMqXMiwocOHECM2BEARAMOKFhNixIhwY8WOHjMaDCkyQEAAIfkEBB4AAAAsAAAAABAAEACB/ObM/P4cAAAAAAAACC8AAQgcSLCgwYMIEypcyLChw4cOA0gMwHAixYQWLSLMOHEjx4sGP4I8qHFhSYIBAQAh+QQEHgAAACwAAAAAEAAQAIH8/hyU6vQAAAAAAAAILwADCBxIsKDBgwgTKlzIsOFCABABMIwoMSFFiggvRsyosaLBjh4PYny40aFJhAEBACH5BAQeAAAALAAAAAAQABAAgfz+HITa/AAAAAAAAAgvAAMIHEiwoMGDCBMqXEgQgEMADB9CTChRIsKKDy9inGhwI8eDFheGZEiypMmSAQEAIfkEBB4AAAAsAAAAABAAEACB/P4cdLbsBLr8AAAACEcABQgcCADAwIMIBRZMeHAhQ4cKDT6UmLAgRAEBAlS0eDBjQ4sgI34E6TCkAJIcMQYoiVKiR4QmGRJMuVHmxYsfZYrUmRNhQAAh+QQEHgAAACwAAAAAEAAQAIH0/gT0ykR0tuwEuvwISwAHCBwIAMDAgwgFFkx4cCHDAAEaGnwYkWFBhwIFCEh4cWLGjQQ7XlTocYDIkSZRnnSo0eHKiRo5omQYEiNCiDRt4rRYUiZNnwgDAgAh+QQEHgAAACwCAAIADAAMAIH0/gT0ykR0tuwEuvwIMwADBBhAsCBBAAAEGjSIkCFCAAsLPoS4cOJEhxYpHsyocQDHjhsbRvT40OHIAQJFRhQYEAAh+QQEHgAAACwAAAAAEAAQAIH0/gT0ykQksvQAAAAIRQAFCBwIAMDAgwgFFkx4cCFDhwoNPpSYsCBEhhEvVrTIUWCAAA05WvT4EaQAkSMHfswoEiNLlwRTbsR4UWNMmDZpUhwYEAAh+QQEHgAAACwAAAAAEAAQAIH0/gT0ykQksvQAAAAIRgAFCBwYIMDAgwgFFkx4EAAAhgIcNnzIUGJFhxQhCsSY8SJHixY3fgSJUeTIiSY/aoxYciXLkAhhohwok2bHhAtdKjSIMCAAIfkEBB4AAAAsBgAAAAQAEACB9P4EJLL0AAAAAAAACBkAAQAIEEAgwYMICwpcyLChw4cMEyY0qDAgADs=\", \"2286\": \"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\", \"2314\": \"R0lGODdhEAAQAIEAAPDw8NbW1ra2tgAAACwAAAAAEAAQAEAIWQAHCBwQoKDBggMJBgAAQIAAhhAhHiwY0aHDgwIPOmSIceDBiB0pNnw4EuTEiAwvGkw4cWVCjy0DvFQokqPLjxAtCmiZkuRGiQZ7ogSKs+LOmwZ/dmQZM2FAADs=\", \"2315\": \"R0lGODdhEAAQAIIAAPDw8NbW1szMzDY2NgAAAAAAAAAAAAAAACwAAAAAEAAQAEAIXwAJCCQQoGCAAQgHDCQYAAAAAQIcSgSQcIDBhhIhQqwo8CJEhxwHXpwYsqDDjw8jUkw4cmLKkB0NwlzIsODMmCYlljQ4UaOAijlRogSKESVJljxdbkyIM8BQpjQvzgwIADs=\", \"2316\": \"R0lGODdhEAAQAIIAAPDw8NbW1s7OzjU1NR0dHQAAAAAAAAAAACwAAAAAEAAQAEAIZgALCCwQoGCAAQgHDCQYAAAAAQIcJpw4wGBDhwAIaCQwUaBFiBQVDrQokaLHixAdagxJEiPClQkXWuy4cKRBmjINlqTZUuXGiQUdpszIkWLQhxEBhETYU+kAmAhPFgRpsubMmAMDAgA7\", \"2317\": \"R0lGODdhEAAQAIIAAPDw8NbW1ioqKhwcHAAAAAAAAAAAAAAAACwAAAAAEAAQAEAIXAAJCCQQoGAAAQgFDCQYAACAAQMSSkxo8GBCiBAlCqyYceLCihMTbmz4MKKAjhJBTkSpcKBKhAs/GtQY86VHhgUlYjSJsKDDjix7kgw60SZCliMLEo2J0yLMgQEBADs=\", \"2318\": \"R0lGODdhEAAQAIEAACoqKhwcHAAAAAAAACwAAAAAEAAQAEAISAAFCBQAoKDBggMJGgwQ4KDDhwsZNjQo8CDDhwkhOqwYseBFjRA/IhyoMWFGiCYVggTA8aHEiS4nigwJcyXNgy0BzBx5EuPAgAA7\", \"2319\": \"R0lGODdhEAAQAIIAAPDw8NbW1sLCwjMzMwAAAAAAAAAAAAAAACwAAAAAEAAQAEAIYgAJCCQwoOCAAAgDDCRoUIAAABAjQkRocIBEhw4TKmRY0OHEhAsrIvyIUGBFjwBQfqwoEWJGkANFwlxo0qBGmhwPBiC5kWVEjAI0nnyYkujKhkZbUjTYsujNnCifhrQ5k0BAADs=\", \"2320\": \"R0lGODdhEAAQAIIAAPDw8NbW1svLyzMzMxkZGQAAAAAAAAAAACwAAAAAEAAQAEAIZgALCCwwoOCAAAgDDCRokACBggAiSkRosOIAARgFJFTIsGLEjQstDviYUGBFhwUxSgRAUeRIABhBDqwoc6FJgzVnWiSJ8KbIjBoTnnx4UcDKlgVRvjwawOXLmCU7GuTJMSTOqAIDAgA7\", \"2321\": \"R0lGODdhEAAQAIIAAPDw8NbW1jMzMxoaGhkZGQAAAAAAAAAAACwAAAAAEAAQAEAIXQALCCwgoKCAAAgDDCRokAABgwYBAEAIEeKAiwMSKmRY8WDChR0LahQI0WHBiwUlUgx5MuPHgRBHLoRpUCbIkDJZYnS5sqBJASgFqAxQ8mHFoSxb5sT58qbIpgUCAgA7\", \"2720\": \"R0lGODlhEAAQAIIAAKjM/4+5/3Wo/1yW/0OH/yh6/xhs/wAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQEFAAAACwAAAAAEAAQAAAIUwAPHCBAkIDAgwgPFjSYsKHDAwAiAniIUOJEigIDaAyAMeNGjAIEDBg5IOTDkCRLCjgpkqRJhyhdrqQY8iXImggN6DTQ8cBOnh0LCC3QcyhRigEBACH5BAQUAAAALAAAAAAQABAAgqjM/4+5/3Wo/1yW/0OH/xhs/wAAAAAAAAhTAAkQGEBwgEADCBMiFFjQIAGFEA0IPBgR4sSHFTMqBMARgMaEHT1+NBCgZICRJE1+FCCgIcuMLF0KgNmy4MuKMW3O1Mjy5sqeCgsILYByKFGNAQEAIfkEBBQAAAAsAAACABAADgCCqMz/j7n/daj/XJb/Q4f/AAAAAAAAAAAACEsACRAYQHCAwAIIEyIUWNAgAYUQCwg8GBHixIcVMyoEwBGAxoQdPX4sEKBkgJEkTX4UIKAhy4wsXQqA2bLgy4oxbc7UyPLmyp4IAwIAIfkEBBQAAAAsAAAAABAAEACCqMz/j7n/daj/XJb/Q4f/KHr/AAAAAAAACFQADRgoQLCAwIMIDxY0mBAhAQIDIg542FDgQ4kTCVQ0cFEixYodI37c+HDkRo4lT6o0AKAlgJUsXcIMQDPAzJoqBQjAqHOjTp4CfO6U2LPiT6ICAgIAIfkEBBQAAAAsAAAAABAADgCCqMz/j7n/daj/XJb/Q4f/KHr/GGz/AAAACEsADxwwQNCAwIMIDxY0mLBhgYcFGjqEKPEgAQIDMg64WPGixo0EOmLUyFGiR5IhKx64WFLlSpYuXQKYCSDmAZo1YwbYGcAmz54HAgIAIfkEBBQAAAAsAAAAABAAEACCqMz/j7n/daj/XJb/Q4f/KHr/GGz/AAAACFQADwgcSFCAQQEEEw48iHCggYcGFCqEGFEiwQIYC1i8mHHjAQIEBogcANIiyJEkCZgMObKkxJMtVW4E6dIjTZkeLQLYCSDnAZ49cwYYGsAn0aIHAgIAIfkEBBQAAAAsAAAAABAAEACCqMz/daj/XJb/Q4f/KHr/GGz/AAAAAAAACFMADQgcKDBAAAEIBRgkSNBgQoUBGDI0uFDiRIoEC2gsYJHhRo4dBxIYSSCkSJImBwx4qLKjSpYDXK5M2NLiS5oxQ6qsmXKnSZMAggL4aUDoUAMBAQAh+QQEFAAAACwAAAIAEAAOAIJ1qP9clv9Dh/8oev8YbP8AAAAAAAAAAAAISAALCBwoEACAAAgDGCRI0GBChQAYMjS4UOJEigQJaCRgkeFGjh0HDhg5IKRIkiYFCHiosqNKlgJcrkzY0uJLmjFDqqyZcqfJgAAh+QQEFAAAACwAAAAAEAAQAIKPuf91qP9clv9Dh/8oev8YbP8AAAAAAAAIVgANCBxIEIBBAAQTDjyIUOHAAAEESBQA0aEBiBMpBrCIcWJFhx0lfuQIcaPFhyUJFlhZ4ORAli1dGiBAk4DMmTVdDhiQcafFnT0H/OQ50adDoEWFOgwIACH5BAQUAAAALAAAAAAQAA4AgqjM/4+5/3Wo/1yW/0OH/yh6/xhs/wAAAAhLAA8IHEgQgEEABBMOPIhQYcIAEAM4fBhxokABAgZoHIBxIsaNHAV4zLixo8OPJUVaxGjS4gGWKgUamGnApUyaNg8U2FkgJ8+eFgMCADs=\", \"29839\": \"R0lGODlhEAAQAIEAAGRmZAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQECgAAACwAAAAAEAAQAAAIKQABCBxIsKDBgwQDBECYUOFChgIdSpxIsaLFixgzatzIsaPHjyBDVgwIACH5BAQKAAAALAAAAAAQAAYAgfz6BJSSbAAAAAAAAAggAAMIHEiwoMGDBAUIQJhQ4UKGAh1KdAgAwMSLFC1ODAgAIfkEBAoAAAAsAAAAABAABgCBZGZkAAAAAAAAAAAACB0AAQgcSLCgwYMEAwRAmFDhQoYCHUqcSLGixQABAQAh+QQECgAAACwAAAAAEAAIAIHk3qT8+gQAAAAAAAAIJwABCBxIsKDBgwQFCECYUOFChgIdSnQYIMDEixQtYpRYcePFjhgDAgAh+QQECgAAACwAAAAAEAAIAIFkZmQAAAAAAAAAAAAIIAABCBxIsKDBgwQDBECYUOFChgIdSpxIsaLFixgzOgwIACH5BAQKAAAALAAAAAAQAAoAgeTepPz6BAAAAAAAAAgtAAEIHEiwoMGDBAUIQJhQ4UKGAh1KdBggwMSLFC1ilFhx48WOHhWCDClS48aAACH5BAQKAAAALAAAAAAQAAoAgWRmZAAAAAAAAAAAAAgiAAEIHEiwoMGDBAMEQJhQ4UKGAh1KnEixosWLGDNq3IgxIAAh+QQECgAAACwAAAAAEAAMAIHk3qT8+gQAAAAAAAAIMgABCBxIsKDBgwQFCECYUOFChgIdSnQYIMDEixQtYpRYcePFjh4VggwpUiPJjCdLbgwIACH5BAQKAAAALAAAAAAQAAwAgWRmZAAAAAAAAAAAAAgkAAEIHEiwoMGDBAMEQJhQ4UKGAh1KnEixosWLGDNq3Mix48aAACH5BAQKAAAALAAAAAAQAA4AgeTepPz6BAAAAAAAAAg2AAEIHEiwoMGDBAUIQJhQ4UKGAh1KdBggwMSLFC1ilFhx48WOHhWCDClSI8mMJ0ueHEmS5cWAACH5BAQKAAAALAAAAAAQAA4AgWRmZAAAAAAAAAAAAAgnAAEIHEiwoMGDBAMEQJhQ4UKGAh1KnEixosWLGDNq3Mixo8ePGgMCACH5BAQKAAAALAAAAAAQABAAgeTepPz6BAAAAAAAAAg7AAEIHEiwoMGDBAUIQJhQ4UKGAh1KdBggwMSLFC1ilFhx48WOHhWCDClSI8mMJ0ueHEmS5UaXHmFeDAgAIfkEBAoAAAAsAAAAABAAEACBZGZkAAAAAAAAAAAACCkAAQgcSLCgwYMEAwRAmFDhQoYCHUqcSLGixYsYM2rcyLGjx48gQ1YMCAA7\", \"36637\": \"R0lGODlhEAAQAIIAAPz2BPzKBPy2BBzKBASa/ASGDJRuBAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQEZAAAACwAAAAAEAAQAAAIZQAPHBhAcIDAgwcAKAQgsKBBhAkXEixQwCHEiBMrFryokKIBAw0fXvQIcqDIiwc+okSpciXEli4PwnQpQMDHAAFqEtjJc2fNmzkF9OxZsyZOnDqHFhVwNOhQAk2jOuUptWnSnQEBACH5BAQUAAAALAYACgAGAAYAg/z2BPzKBPy2BHy67BzKBASa/ASGDJRuBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgaAAcMKECwgMCCBQIEOJhw4cCGAgQIVBhRYEAAIfkEBGQAAAAsCAAOAAQAAgCD/PYE/MoE/LYEfLrsHMoEBJr8BIYMlG4EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAkABwwoUEAgwYAAIfkEBGQAAAAsCAAOAAQAAgCD/PYE/MoE/LYEfLrsHMoEBJr8BIYMlG4EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAkABQgYMEAgwYAAOw==\", \"39706\": \"R0lGODdhEAAQAIEAABn8ACKqEwAAAAAAACwAAAAAEAAQAEAINgAFCBQQIACAgwgTKlyosCBDhgIfLowosWJFhxYPDiRoUOJGjA8pZgSZsaTJhCQrirT4sePDgAA7\", \"39709\": \"R0lGODdhEAAQAIEAABn8AAAAAAAAAAAAACwAAAAAEAAQAEAIHQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFgQEBADs=\", \"39710\": \"R0lGODdhEAAQAIEAAPzoABn8AAAAAAAAACwAAAAAEAAQAEAINgADCBwoEIDBgwYJEkSIUOFAhgcdFoQIQGIAihUlYrS4USNFjh89QgQ5UiRDkidNNlQZkaXBgAA7\", \"39711\": \"R0lGODdhEAAQAIEAAPzoAAAAAAAAAAAAACwAAAAAEAAQAEAIHQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFgQEBADs=\", \"39712\": \"R0lGODdhEAAQAIEAAPzoAPylAAAAAAAAACwAAAAAEAAQAEAINgABCBwoMIDBgwYJEkSIUOFAhgcdFoQYQCIAihUlYrS4USNFjh89QgQ5UiRDkidNNlQZkaXBgAA7\", \"39713\": \"R0lGODdhEAAQAIEAAPylAAAAAAAAAAAAACwAAAAAEAAQAEAIHQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFgQEBADs=\", \"39714\": \"R0lGODdhEAAQAIEAAPylAPwAAAAAAAAAACwAAAAAEAAQAEAINgABCBwoMIDBgwYJEkSIUOFAhgcdFoQYQCIAihUlYrS4USNFjh89QgQ5UiRDkidNNlQZkaXBgAA7\", \"39715\": \"R0lGODdhEAAQAIEAAPwAAAAAAAAAAAAAACwAAAAAEAAQAEAIHQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFgQEBADs=\", \"39716\": \"R0lGODdhEAAQAIEAAPwAAKoAFwAAAAAAACwAAAAAEAAQAEAINgABCBwoMIDBgwYJEkSIUOFAhgcdFoQYQCIAihUlYrS4USNFjh89QgQ5UiRDkidNNlQZkaXBgAA7\", \"39717\": \"R0lGODdhEAAQAIEAAKoAFwAAAAAAAAAAACwAAAAAEAAQAEAIHQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFgQEBADs=\", \"39718\": \"R0lGODdhEAAQAIEAAKoAF3UAOAAAAAAAACwAAAAAEAAQAEAINgABCBwoMIDBgwYJEkSIUOFAhgcdFoQYQCIAihUlYrS4USNFjh89QgQ5UiRDkidNNlQZkaXBgAA7\", \"39719\": \"R0lGODdhEAAQAIEAAHUAOAAAAAAAAAAAACwAAAAAEAAQAEAIHQABCBxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFgQEBADs=\", \"43737\": \"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\", \"49300\": \"R0lGODlhEAAQAIIAAOTm5MTGxKSipGxubERSjCRCzERCRAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQEFAAAACwAAAAAEAAQAAAIaAAPCBxI0IBBAwQTDjyIcOFBgQYBSARgEOLDAxEnMgzAMYDBjiA9GgD5MSRHAShTqlzJsqVKgwNiypwZkyHNmwMqHihQwCBPnz0N8BT4U2jQokMVKl3K9AABAgKfRoXqlKrUqlOzHggIACH5BAQUAAAALAAACgAQAAYAguTm5MTGxKSipGxubERSjCRCzERCRAAAAAgrAA8cIEDAgAGCBhEeJCBQocOCCwUWKCCR4oGJFTNetIhxo8CPIEOKHBkyIAAh+QQEFAAAACwAAAoAEAAGAILk5uTExsSkoqRsbmxEUowkQsxEQkQAAAAIMAALFDBgQCBBgwULHDiAsOHAhAsXEiAgkeKBiRUzXrSIceNCgR8VMhQJcmTIkyMDAgAh+QQEFAAAACwAAAoAEAAGAILk5uTExsSkoqRsbmxEUowkQsxEQkQAAAAIMAAJEDBgQCBBgwUJHDiAsOHAhAsLFIg48YBEihgtVryoceFCgR8VMhQJcmTIkyMDAgAh+QQEFAAAACwAAAoAEAAGAILk5uTExsSkoqRsbmxEUowkQsxEQkQAAAAILwAPHDBAsKBBggIFHlxoQCABAg4hHngYseJEiRQvCixQYGPHAxw9igT5MSRJgQEBADs=\", \"53384\": \"R0lGODlhEAAQAIIAAOTm5MTGxKSipGxubERCRAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQEFAAAACwAAAAAEAAQAAAIVAALCBxIsKDBgwgNElhIIOFAhg0fMhS4EIBFAAspTixQ8SLEACADLAxJUiQBkiNLghTAsqXLlzBjulw4oKbNmzUh4tw5ICNHiEB9agwK0aHRowUCAgAh+QQEFAAAACwAAAIAEAAMAILk5uTExsSkoqRsbmxEQkQAAAAAAAAAAAAISgALCBxIUCCBgwQKKiyAMOHAhgYJAJgIgCBEhhIpRgzAMcDBjh03dvwIMoBAAShTqlR5cqVLlBEHyJxJU2bMmjgtNtx5UCfPhgEBACH5BAQUAAAALAIAAgAMAAwAguTm5MTGxKSipGxubERCRAAAAAAAAAAAAAg8AAsIHEiwoMGDBBISEJiQoMKFBRpGJBCgYoCEFRlStIgxgEABIEOK/CiypMYBKFOiPKkypcOHCl/CJBAQACH5BAQUAAAALAQAAgAMAAwAgsTGxKSipGxubERCRAAAAAAAAAAAAAAAAAg8AAkIHEiwoMGDAxIOEJiQoMKFBBpGHACgIoCEFRlStIgRgMAAIEOK/CiypEYBKFOiPKkypcOHCl/CHBAQACH5BAQUAAAALAYABAAKAAoAgsTGxKSipGxubERCRAAAAAAAAAAAAAAAAAgxAAkIJDCg4ICBAw0eTDgAgEMABQUWfAhxYYCLGC8KzJhR4gABIEN6DCmSoUKECgsGBAAh+QQEFAAAACwIAAQACAAKAILExsSkoqRsbmxEQkQAAAAAAAAAAAAAAAAILAAJCCQwoOCAgQQNCiwIoCGAhQMcPiQQoKJFgRYvJhTAUQDEjh4HGjwo0mBAACH5BAQUAAAALAoABAAEAAoAgsTGxKSipGxubERCRAAAAAAAAAAAAAAAAAgYAAkIHEhwwACBBgUGCKCQIYGEDw8SHBgQACH5BAQUAAAALAwABAAEAAoAgaSipERCRAAAAAAAAAgYAAUIHEgwQACBBgUCAKCQoYCEDw8SHBgQACH5BAQUAAAALA4ABgACAAYAgQAAAAAAAAAAAAAAAAgIAAEIHEhQYEAAIfkEBBQAAAAsAAAEAAIACACBxMbEpKKkREJEAAAACA8ABQgUAKAggAAIAwwUEBAAIfkEBBQAAAAsAAACAAQADACC5ObkxMbEpKKkbG5sREJEAAAAAAAAAAAACCIACRAoUEAgQQAABCIUGKChw4YCIkqMOGCAwIoCDRYcWCAgACH5BAQUAAAALAIAAgAEAAwAguTm5MTGxKSipGxubERCRAAAAAAAAAAAAAgiAAkQKFBAIEEAAAQiFBigocOGAiJKjDhggMCKAg0WHFggIAAh+QQEFAAAACwAAAIACAAMAILk5uTExsSkoqRsbmxEQkQAAAAAAAAAAAAIMQALFCBAkIBAgQUNDiQAoCGAhA4fEghAsaLFiwEEaNzIsaOAASBDEgwpMmFBhCYFBgQAIfkEBBQAAAAsAAACAAoADACC5ObkxMbEpKKkbG5sREJEAAAAAAAAAAAACDgACwgsQKAggYEDDR5MSACAQwAFBRZ8CNFggIsYLxbMmFGAx48gQ4YcQLIkyYImTSpcuZBlxAIBAQAh+QQEFAAAACwAAAIADAAMAILk5uTExsSkoqRsbmxEQkQAAAAAAAAAAAAIPgALCBxIoCCBgQgLGDyokGFBABABLBT4MGLBAAEuYtzIUSNHjAJCihxJsqTIAShTqiyosuWAhTANUowps0BAACH5BAQUAAAALAIAAgAMAAwAguTm5MTGxKSipGxubERCRAAAAAAAAAAAAAg+AAsIHEigIIGBCAsYPKiQYUEAEAEsFPgwYsEAAS5i3MhRI0eMAkKKHEmypMgBKFOqLKiy5YCFMA1SjCmzQEAAOw==\", \"53386\": \"R0lGODdhEAAQAIEAAP/7AMC9AFdWAAAAACwAAAAAEAAQAEAIVwAHCBwgQECAgwEKDhxwEIDDhxAdHizYMKLEhAIEIgwAcePCjR0RauRoMeJEgyQtnlxIEaHChQNbroQJ8qFHgihLAjhZUefFnj55pjSJcSTQmyxRzhQYEAA7\"};\n\n// Layout: 16x16 icon fills the left column (position [0,0]), two lines of\n// fontHeight:5 text sit to its right (x:18, ~34px/~8 chars per line -\n// confirmed empirically on the real device, including 3-digit values like\n// \"TMP 100C\"/\"HUM 100%\"). No native scroll on TC002, so long content is\n// split across the two lines rather than left to clip - see\n// TC002-PUSH-NOTES.md.\n//\n// Runs in \"Run Once for All Items\" mode - must iterate $input.all()\n// ourselves and return one output item per input item. (Previously used\n// $input.item, which in this mode always resolves to item 0 - silently\n// dropped weather_forecast/aqi/sunrise_sunset/moon_phase and only ever\n// pushed current_weather. Fixed here.)\n//\n// TC002 has no native cycling-speed setting like AWTRIX NG's\n// carouselSpeed - duration is set per-app-push instead. Fixed at 30s so\n// every active app gets equal, generous screen time on the physical\n// device (overrides the upstream durationMs, which stays 8000 for the\n// AWTRIX NG side).\nconst TC002_DURATION_SEC = 30;\n\nfunction buildOne(item) {\n  const iconId = item.payload && item.payload.icon;\n  const rawText = (item.payload && item.payload.text) || '';\n  const content = rawText.replace(/[^\\x20-\\x7E]/g, '').toUpperCase();\n  const icon = iconId && ICON16_B64[iconId];\n\n  let line1, line2;\n  let degRingX = null; // x of the drawn degree ring (current_weather only); null = none\n\n  if (item.app === 'current_weather') {\n    // Source text is \"29\\u00b0C 75%\"; the \\u00b0 was stripped above because\n    // TC002's font has no degree glyph. Rebuild it as \"TMP 29\" + a drawn\n    // 3x3 degree ring + \"C\", with \"HUM 75%\" below. Labelled because the two\n    // bare numbers on their own are ambiguous (which is temp, which humidity).\n    const m = content.match(/^(\\d+)C\\s+(\\S+)$/);\n    if (m) {\n      line1 = `TMP ${m[1]}`;\n      line2 = `HUM ${m[2]}`;\n      degRingX = 18 + Math.round(line1.length * 4.2); // ~4.2 px/char at fontHeight 5\n    } else {\n      const m2 = content.match(/^(\\S+)\\s+(\\S+)$/);\n      line1 = m2 ? `TMP ${m2[1]}` : content;\n      line2 = m2 ? `HUM ${m2[2]}` : '';\n    }\n  } else {\n    // Generic split: first word on line 1, last word on line 2. Works for\n    // \"FORECAST 5-7PM\" -> \"FORECAST\"/\"5-7PM\", \"PM2.5 12\" -> \"PM2.5\"/\"12\",\n    // \"RISE 7:01AM\" -> \"RISE\"/\"7:01AM\", and \"WANING GIBBOUS 99%\" ->\n    // \"WANING\"/\"99%\" (middle word dropped - the icon already conveys the\n    // specific phase, so the leading word + illumination is enough).\n    // Exception: \"NEW MOON 0%\" / \"FULL MOON 100%\" - dropping the middle\n    // word there drops the literal word \"MOON\", leaving just \"NEW\"/\"0%\"\n    // with no indication of what's being shown. Keep \"MOON\" on line 1\n    // for those two phases instead of dropping it.\n    const words = content.split(' ').filter(Boolean);\n    if (words.length === 3 && words[1] === 'MOON') {\n      line1 = `${words[0]} ${words[1]}`;\n      line2 = words[2];\n    } else {\n      line1 = words[0] || '';\n      line2 = words.length > 1 ? words[words.length - 1] : '';\n    }\n  }\n\n  let text;\n  if (icon && degRingX !== null) {\n    // \"TMP 29\" | drawn degree ring | \"C\"  (temp), then \"HUM 75%\" below.\n    text = [\n      { content: line1, fontHeight: 5, x: 18, y: 1, color: '#FFFFFF' },\n      { content: 'C', fontHeight: 5, x: degRingX + 4, y: 1, color: '#FFFFFF' },\n      { content: line2, fontHeight: 5, x: 18, y: 9, color: '#3EE08A' },\n    ];\n  } else if (icon) {\n    text = [\n      { content: line1, fontHeight: 5, x: 18, y: 1, color: '#FFFFFF' },\n      { content: line2, fontHeight: 5, x: 18, y: 9, color: '#3EE08A' },\n    ];\n  } else {\n    text = [{ content, fontHeight: 10, x: 0, y: 3, align: 'center', rect: [0, 0, 52, 16], color: '#FFFFFF' }];\n  }\n\n  const tc002Payload = { duration: TC002_DURATION_SEC, text };\n\n  if (icon && degRingX !== null) {\n    // 3x3 rectangle outline = a tiny hollow ring, sat high (y:0) so it\n    // reads as a superscript degree mark between the number and \"C\".\n    tc002Payload.draw = [{ dr: [degRingX, 0, 3, 3, '#FFFFFF'] }];\n  }\n  if (icon) {\n    tc002Payload.image = [{ data: `data:image/gif;base64,${icon}`, position: [0, 0] }];\n  }\n\n  return { json: { app: item.app, tc002Payload } };\n}\n\nconst built = $input.all().map((entry, i) => {\n  const out = buildOne(entry.json);\n  out.pairedItem = { item: i };\n  return out;\n});\nconst present = new Set(built.map((b) => b.json.app));\n\n// sunrise_sunset / moon_phase are only emitted by Build Payloads within\n// their time windows (near sunrise/sunset, and night, respectively). On\n// AWTRIX NG they carry lifetimeMs so the clock auto-expires them; TC002\n// has no lifetime mechanism, so an app stays in /api/customList until an\n// explicit empty {} POST removes it. When they're out of window we must\n// actively clear them here, or a stale sunrise/moon card lingers on the\n// clock all day. tc002Payload:{} -> the Push node POSTs {} -> slot cleared.\n// pairedItem -> item 0 so downstream expressions (e.g. the Push node's\n// $('Config...').item) still resolve for these synthetic clear rows.\nfor (const app of ['sunrise_sunset', 'moon_phase']) {\n  if (!present.has(app)) {\n    built.push({ json: { app, tc002Payload: {} }, pairedItem: { item: 0 } });\n  }\n}\n\nreturn built;\n"
+      },
+      "name": "Build Payload TC002",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://{{ $('Config (edit per location)').item.json.CLOCK2_IP }}/api/custom?name={{ $json.app }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.tc002Payload) }}"
+      },
+      "name": "Push to Clock 2 (TC002)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        0,
+        200
+      ]
+    }
+  ],
+  "connections": {
+    "Every 5min": {
+      "main": [
+        [
+          {
+            "node": "Config (edit per location)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config (edit per location)": {
+      "main": [
+        [
+          {
+            "node": "Fetch Air Temperature (data.gov.sg)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Air Temperature (data.gov.sg)": {
+      "main": [
+        [
+          {
+            "node": "Fetch Relative Humidity (data.gov.sg)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Relative Humidity (data.gov.sg)": {
+      "main": [
+        [
+          {
+            "node": "Fetch Forecast/PM2.5 (cached 30min)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Payloads": {
+      "main": [
+        [
+          {
+            "node": "Push to Clock",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Payload TC002",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Forecast/PM2.5 (cached 30min)": {
+      "main": [
+        [
+          {
+            "node": "Build Payloads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Payload TC002": {
+      "main": [
+        [
+          {
+            "node": "Push to Clock 2 (TC002)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

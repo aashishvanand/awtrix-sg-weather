@@ -1,8 +1,10 @@
 # Ulanzi SG Weather — Live Weather for AWTRIX (Singapore)
 
 An n8n workflow that replaces the native `Temperature` and `Humidity` apps on a
-Ulanzi Pixel Clock (**AWTRIX NG** firmware) with live outdoor data for a
-Singapore location. The clock's onboard sensor sits indoors next to a power
+Ulanzi Pixel Clock (TC001 with **AWTRIX NG** firmware) with live outdoor data
+for a Singapore location. It can also drive a second clock, a Ulanzi
+**TC002**, running either AWTRIX NG or the stock Ulanzi firmware (see
+[Second clock (TC002)](#second-clock-tc002)). The clock's onboard sensor sits indoors next to a power
 supply, so it is a poor proxy for outdoor conditions; this workflow pushes
 readings from [data.gov.sg](https://data.gov.sg)'s NEA real-time APIs instead.
 
@@ -36,11 +38,14 @@ nodes with an API that covers your region.
 
 ## Hardware and firmware
 
-1. Flash **AWTRIX NG** with the official web flasher (Chrome / Edge / Opera):
-   <https://blueforcer.github.io/awtrix3/#/flasher>. Connect over USB-C, click
-   **Connect**, select the serial port, tick **Erase Device**, then **Install**.
-2. On first boot the clock broadcasts an `AWTRIX_xxxxx` Wi-Fi hotspot
-   (password `12345678`). Join it and enter your home Wi-Fi credentials.
+1. Flash **AWTRIX NG** from the browser (Chrome / Edge / Opera), following
+   [Install AWTRIX NG](https://blueforcer.github.io/awtrix-ng/esp32/getting-started/flashing/)
+   for the TC001: connect over USB-C and press **Fresh install**. (A TC002
+   uses a desktop USB installer instead, see
+   [its install guide](https://blueforcer.github.io/awtrix-ng/tc002/getting-started/tc002/).)
+2. On first boot the clock opens an open setup hotspot named
+   `awtrixng-xxxxxx`. Join it, open `http://192.168.4.1` and enter your home
+   Wi-Fi credentials.
 3. Give the clock a static IP on your router. This README uses `<CLOCK_IP>` as a
    placeholder throughout.
 4. The clock needs no WAN access for this workflow — every push is over the LAN.
@@ -51,16 +56,17 @@ The web UI at `http://<CLOCK_IP>` is where icons, apps, and settings live.
 
 ## One-time clock setup
 
-Disable the native sensor apps so they do not compete with the pushed ones:
+Switch off the native sensor apps so they do not compete with the pushed ones
+(also possible in the web UI's Apps view):
 
 ```bash
-curl --location 'http://<CLOCK_IP>/api/settings' \
-  --header 'Content-Type: application/json' \
-  --data '{ "HUM": false, "TEMP": false }'
-curl --location --request POST 'http://<CLOCK_IP>/api/reboot'
+for app in Temperature Humidity; do
+  curl -X PUT "http://<CLOCK_IP>/api/v1/apps/$app/enabled" \
+    -H 'Content-Type: application/json' -d 'false'
+done
 ```
 
-Both settings take effect only after the reboot.
+The switch takes effect at once and is kept after a restart.
 
 ## Icons
 
@@ -186,7 +192,7 @@ Import through n8n's **Import from File**, then fill in the **Config** node:
 | `HOME_LAT` / `HOME_LON` | Coordinates used for the nearest station / area / region match |
 | `CLOCK_IP` | The AWTRIX NG clock's static IP |
 | `DATA_GOV_SG_API_KEY` | From [data.gov.sg](https://guide.data.gov.sg/developer-guide/api-keys). The endpoints work without a key, but one raises the rate limit and is more reliable |
-| `CLOCK2_IP` | Optional. Static IP of a second, TC002-firmware clock — see [Second clock (TC002)](#second-clock-tc002) below |
+| `CLOCK2_IP` | Optional. Static IP of a second clock, a Ulanzi TC002 — see [Second clock (TC002)](#second-clock-tc002) below |
 
 ### Execution flow
 
@@ -219,7 +225,8 @@ roughly 6×.
 | `moon_phase` | between sunset and the next sunrise | Phase icon and illuminated fraction (e.g. `WANING GIBBOUS 99%`) |
 
 The native **clock** (`Time`) app and the **airline** app (from the separate
-[Awtrix Feeder](../Awtrix%20Feeder) workflow) are outside this workflow's scope.
+[awtrix-flightwall](https://github.com/aashishvanand/awtrix-flightwall) workflow)
+are outside this workflow's scope.
 
 **Why `sunrise_sunset` and `moon_phase` are time-gated.** The moon phase is only
 meaningful after dark, and a sunrise or sunset window is only interesting near
@@ -267,33 +274,55 @@ The pushed-app API rejects unknown keys and validates enums strictly:
 
 ### Second clock (TC002)
 
-Setting `CLOCK2_IP` (leave blank to skip) also pushes every app to a second,
-TC002-firmware clock, in parallel with the AWTRIX NG one:
+Setting `CLOCK2_IP` (leave blank to skip) also pushes every app to a second
+clock, a Ulanzi TC002 (52×16 panel), in parallel with the TC001. There are two
+versions of the workflow, one per TC002 firmware. Import the one that matches
+yours; the TC001 side is identical in both.
+
+| TC002 firmware | Import | TC002 push |
+|---|---|---|
+| **AWTRIX NG** 1.2.2+ (recommended) | `n8n_weather_workflow.json` | `PUT /api/v1/apps/pushed/<app>` with a 52×16 `layout` |
+| Stock **Ulanzi** firmware | `n8n_weather_workflow.ulanzi-firmware.json` | `POST /api/custom?name=<app>` |
 
 ```
-Build Payloads → Build Payload TC002 → Push to Clock 2 (TC002): POST /api/custom?name=<app>
+Build Payloads → Build Payload TC002 → Push to Clock 2 (TC002)
 ```
 
-TC002 differs enough from AWTRIX NG that it needs its own payload builder and
-its own push node, not just a second URL:
+#### TC002 on AWTRIX NG
 
-- **Endpoint.** TC002 has no `PUT /api/v1/apps/pushed/<name>` equivalent — it
-  only exposes `POST /api/custom?name=<app>`, so `Push to Clock 2` uses that
-  older-style call intentionally (it is not a leftover from before AWTRIX NG's
-  endpoint was fixed above).
-- **Text.** TC002 doesn't strip non-ASCII or uppercase automatically the way
-  AWTRIX NG's `textCase: 'upper'` does, so `Build Payload TC002` does both
-  itself (e.g. the `°` in temperature becomes a small drawn ring instead).
-- **Icons.** TC002 has no icon-by-ID gallery. Each AWTRIX icon ID used above is
-  fetched once from the LaMetric gallery as an 8×8 GIF, 2× upscaled to 16×16,
-  and embedded in `Build Payload TC002` as a base64 lookup so every push can
-  inline the matching icon directly in the payload.
-- **Expiry.** TC002 has no `lifetimeMs` mechanism — a pushed app stays until
-  explicitly cleared. So for `sunrise_sunset` / `moon_phase`, when they fall
-  outside their AWTRIX NG time window, `Build Payload TC002` still emits an
-  empty `{}` payload for that app, and `Push to Clock 2` POSTs it to clear the
-  slot; otherwise a stale sunrise or moon card would linger on the clock all
-  day.
+Same API and schema as the TC001. It still has its own payload builder because
+the TC002 panel is 52×16, not 32×8:
+
+- **Layout.** A plain `text`/`icon` payload would be drawn at double size on
+  a 26×8 grid, so `Build Payload TC002` sends a `layout` instead: the icon in
+  a 16×16 box on the left, two text lines in `[18,0,34,8]` and `[18,8,34,8]`
+  (e.g. `TMP 29°C` over `HUM 75%`, `WANING GIBBOUS` over `99%`). Text that
+  doesn't fit its box scrolls through it by itself.
+- **Icons.** Rather than uploading the LaMetric icons to the TC002 too, each
+  one is embedded in `Build Payload TC002` as a 16×16 GIF (the 8×8 original
+  2× upscaled) and sent inline as a `data:image/gif;base64,…` URL. AWTRIX NG
+  1.2+ needs the `data:` prefix; bare base64 is rejected with 422.
+- **Timing.** Every TC002 app gets `durationMs: 30000`. `lifetimeMs` is
+  copied from the upstream payload, so `sunrise_sunset` / `moon_phase`
+  expire on their own outside their windows, same as on the TC001.
+
+#### TC002 on the stock Ulanzi firmware
+
+The stock firmware has a different, smaller API, so this builder works around
+several gaps. It is no longer tested against a live clock (the author's TC002
+now runs AWTRIX NG), but it worked as shipped.
+
+- **Endpoint.** No `PUT /api/v1/apps/pushed/<name>` equivalent — only
+  `POST /api/custom?name=<app>` with `{"duration", "text":[...], "image":[...]}`.
+- **Text.** ASCII only, no scrolling and no automatic uppercasing, so
+  `Build Payload TC002` uppercases and strips non-ASCII itself (the `°` in the
+  temperature becomes a small drawn ring), labels the two lines (`TMP 29` /
+  `HUM 75%`) and splits longer texts over two `fontHeight: 5` lines.
+- **Icons.** No icon-by-ID gallery. The same 16×16 GIFs travel inline in
+  `image[]` on every push.
+- **Expiry.** No `lifetimeMs`. When `sunrise_sunset` / `moon_phase` fall
+  outside their windows, the builder emits an empty `{}` payload for them, and
+  the push node POSTs it to clear the slot.
 
 ### Deploying and updating
 
@@ -311,14 +340,16 @@ by `POST /api/v1/workflows/<id>/activate`).
 ```
 .
 ├── README.md
-├── n8n_weather_workflow.json        # importable workflow, secrets scrubbed
-└── n8n_weather_workflow.local.json  # working copy with real secrets (gitignored)
+├── n8n_weather_workflow.json                  # importable workflow (TC002 on AWTRIX NG), secrets scrubbed
+├── n8n_weather_workflow.ulanzi-firmware.json  # same, for a TC002 on the stock Ulanzi firmware
+└── n8n_weather_workflow.local.json            # working copy with real secrets (gitignored)
 ```
 
 ## Before publishing this repository
 
 - **`.env`** holds the data.gov.sg and n8n API keys. It is gitignored; keep it
   that way.
-- **`n8n_weather_workflow.json`** — confirm the `Config` node's
-  `DATA_GOV_SG_API_KEY` is a placeholder. Deploy from
+- **`n8n_weather_workflow.json`** and
+  **`n8n_weather_workflow.ulanzi-firmware.json`** — confirm the `Config`
+  node's `DATA_GOV_SG_API_KEY` is a placeholder. Deploy from
   `n8n_weather_workflow.local.json` (gitignored) instead.
